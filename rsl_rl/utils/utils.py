@@ -285,3 +285,42 @@ def resolve_obs_groups(
     print("-" * 80)
 
     return obs_groups
+
+
+def store_code_state(logdir: str, repositories: list[str]) -> list[str]:
+    """Store the git status and diff of the given repositories in the log directory.
+
+    Args:
+        logdir: Directory in which the ``git`` folder with diff files is created.
+        repositories: List of file paths inside the repositories to log.
+
+    Returns:
+        List of created diff file paths (for upload to external logging services).
+    """
+    import git
+    import os
+    import pathlib
+
+    git_log_dir = os.path.join(logdir, "git")
+    os.makedirs(git_log_dir, exist_ok=True)
+    file_paths = []
+    for repository_file_path in repositories:
+        try:
+            repo = git.Repo(repository_file_path, search_parent_directories=True)
+            t = repo.head.commit.tree
+        except Exception:
+            print(f"Could not find git repository in {repository_file_path}. Skipping.")
+            continue
+        # Get the name of the repository
+        repo_name = pathlib.Path(repo.working_dir).name
+        diff_file_name = os.path.join(git_log_dir, f"{repo_name}.diff")
+        # Check if the diff file already exists
+        if os.path.isfile(diff_file_name):
+            continue
+        # Write the diff file
+        print(f"Storing git diff for '{repo_name}' in: {diff_file_name}")
+        with open(diff_file_name, "x", encoding="utf-8") as f:
+            content = f"--- git status ---\n{repo.git.status()} \n\n\n--- git diff ---\n{repo.git.diff(t)}"
+            f.write(content)
+        file_paths.append(diff_file_name)
+    return file_paths

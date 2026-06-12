@@ -11,6 +11,7 @@ from .utils import (
     resolve_obs_groups,
     resolve_optimizer,
     split_and_pad_trajectories,
+    store_code_state,
     string_to_callable,
     unpad_trajectories,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "resolve_obs_groups",
     "resolve_optimizer",
     "split_and_pad_trajectories",
+    "store_code_state",
     "string_to_callable",
     "unpad_trajectories",
 ]

@@ -280,6 +280,7 @@ class HimOnPolicyRunner:
         saved_dict = {
             "model_state_dict": self.alg.policy.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "estimator_optimizer_state_dict": self.alg.policy.estimator.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
@@ -297,6 +298,9 @@ class HimOnPolicyRunner:
         if load_optimizer and resumed_training:
             # Algorithm optimizer
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            # Estimator optimizer
+            if "estimator_optimizer_state_dict" in loaded_dict:
+                self.alg.policy.estimator.optimizer.load_state_dict(loaded_dict["estimator_optimizer_state_dict"])
         # Load current learning iteration
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]

@@ -61,6 +61,8 @@ class HIMActorCritic(nn.Module):
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
+        obs_term_dims: list[int] | None = None,
+        history_length: int | None = None,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -79,11 +81,38 @@ class HIMActorCritic(nn.Module):
 
         self.state_dependent_std = state_dependent_std
 
-        # Him
-        self.history_size = 6 # default set to be 6
-        num_one_step_obs = int(num_actor_obs/self.history_size)
+        # HIM history layout
+        # IsaacLab concatenates observation terms TERM-MAJOR and flattens each term's
+        # history oldest->newest, i.e. the actor obs is laid out as
+        #     [term0_t0..term0_t{H-1}, term1_t0..term1_t{H-1}, ...].
+        # HIM needs a TIME-MAJOR layout where each timestep holds the full one-step obs
+        # (this is the "sequence by time" processing used by HIMLoco / Go2Arm).
+        # `obs_term_dims` is the per-single-step dimension of each policy obs term in
+        # concatenation order; it is used by `_to_time_major` to reorder term-major ->
+        # time-major. When it is None we assume the policy obs is a single term whose
+        # history is already contiguous in time (term-major == time-major for one term).
         self.num_actions = num_actions
-        self.num_one_step_obs = num_one_step_obs
+        self.obs_term_dims = list(obs_term_dims) if obs_term_dims is not None else None
+        if self.obs_term_dims is not None:
+            self.num_one_step_obs = sum(self.obs_term_dims)
+            assert num_actor_obs % self.num_one_step_obs == 0, (
+                f"Actor obs dim ({num_actor_obs}) is not divisible by the one-step obs dim "
+                f"({self.num_one_step_obs}) implied by obs_term_dims={self.obs_term_dims}."
+            )
+            self.history_size = num_actor_obs // self.num_one_step_obs
+            if history_length is not None:
+                assert history_length == self.history_size, (
+                    f"history_length ({history_length}) disagrees with the history size "
+                    f"({self.history_size}) inferred from num_actor_obs / sum(obs_term_dims)."
+                )
+        else:
+            self.history_size = history_length if history_length is not None else 6
+            assert num_actor_obs % self.history_size == 0, (
+                f"Actor obs dim ({num_actor_obs}) is not divisible by history_length "
+                f"({self.history_size}). Provide `obs_term_dims` or a matching `history_length`."
+            )
+            self.num_one_step_obs = num_actor_obs // self.history_size
+        num_one_step_obs = self.num_one_step_obs
 
         mlp_input_dim_a = num_one_step_obs + 3 + 16
 
@@ -92,9 +121,11 @@ class HIMActorCritic(nn.Module):
         print(f"Actor MLP: {self.actor}")
 
         # Actor observation normalization
+        # Note: the normalizer operates on the full (history) actor obs, so it must be
+        # sized to `num_actor_obs`, not the actor MLP input.
         self.actor_obs_normalization = actor_obs_normalization
         if actor_obs_normalization:
-            self.actor_obs_normalizer = EmpiricalNormalization(mlp_input_dim_a)
+            self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs)
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
 
@@ -115,24 +146,15 @@ class HIMActorCritic(nn.Module):
         print(f'Estimator: {self.estimator.encoder}')
 
         # Action noise
+        # HIM (like HIMLoco) only supports a learned scalar std parameter.
         self.noise_std_type = noise_std_type
         if self.state_dependent_std:
-            torch.nn.init.zeros_(self.actor[-2].weight[num_actions:])
-            if self.noise_std_type == "scalar":
-                torch.nn.init.constant_(self.actor[-2].bias[num_actions:], init_noise_std)
-            elif self.noise_std_type == "log":
-                torch.nn.init.constant_(
-                    self.actor[-2].bias[num_actions:], torch.log(torch.tensor(init_noise_std + 1e-7))
-                )
-            else:
-                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
-        else:
-            if self.noise_std_type == "scalar":
-                self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
-            elif self.noise_std_type == "log":
-                self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
-            else:
-                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+            raise ValueError("HIMActorCritic does not support state_dependent_std.")
+        if self.noise_std_type != "scalar":
+            raise ValueError(
+                f"HIMActorCritic only supports noise_std_type='scalar', got '{self.noise_std_type}'."
+            )
+        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
 
         # Action distribution
         # Note: Populated in update_distribution
@@ -176,22 +198,53 @@ class HIMActorCritic(nn.Module):
     def get_critic_obs(self, obs: TensorDict) -> torch.Tensor:
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["critic"]]
         return torch.cat(obs_list, dim=-1)
-    
+
+    def _to_time_major(self, obs_flat: torch.Tensor) -> torch.Tensor:
+        """Reorder a term-major actor obs into a time-major history tensor.
+
+        IsaacLab lays out the actor obs term-major (each term's history flattened
+        oldest->newest):
+            ``[term0_t0..term0_t{H-1}, term1_t0..term1_t{H-1}, ...]``
+        HIM expects a time-major layout where each timestep holds the full one-step obs.
+
+        Args:
+            obs_flat: Flattened actor obs of shape ``(N, num_actor_obs)``.
+
+        Returns:
+            Tensor of shape ``(N, history_size, num_one_step_obs)`` ordered oldest->newest;
+            the last time index (``[:, -1, :]``) is the most recent observation.
+        """
+        n = obs_flat.shape[0]
+        if self.obs_term_dims is None:
+            # Single term: its history is already contiguous in time.
+            return obs_flat.reshape(n, self.history_size, self.num_one_step_obs)
+        h = self.history_size
+        chunks = []
+        offset = 0
+        for d in self.obs_term_dims:
+            # (N, H*d) term-major block -> (N, H, d)
+            chunks.append(obs_flat[:, offset : offset + h * d].reshape(n, h, d))
+            offset += h * d
+        # Concatenate term features per timestep -> (N, H, num_one_step_obs)
+        return torch.cat(chunks, dim=-1)
+
+    def get_actor_obs_history(self, obs: TensorDict) -> torch.Tensor:
+        """Return the normalized, time-major, flattened actor obs history ``(N, H*one_step)``."""
+        obs_flat = self.actor_obs_normalizer(self.get_actor_obs(obs))
+        return self._to_time_major(obs_flat).flatten(1)
+
     def _update_distribution(self, obs: torch.Tensor) -> None:
+        # Reorder term-major obs into a time-major history (oldest->newest)
+        hist = self._to_time_major(obs)  # (N, history_size, num_one_step_obs)
+        obs_history = hist.flatten(1)  # (N, history_size * num_one_step_obs) time-major
+        current_obs = hist[:, -1, :]  # (N, num_one_step_obs) most recent timestep
         with torch.no_grad():
-            vel, latent = self.estimator(obs)
-        actor_input = torch.cat((obs[:,:self.num_one_step_obs], vel, latent), dim=-1)
+            vel, latent = self.estimator(obs_history)
+        actor_input = torch.cat((current_obs, vel, latent), dim=-1)
         # Compute mean
         mean = self.actor(actor_input)
-        # Compute standard deviation
-        # if self.noise_std_type == "scalar":
-        #     std = self.std.expand_as(mean)
-        # elif self.noise_std_type == "log":
-        #     std = torch.exp(self.log_std).expand_as(mean)
-        # else:
-        #     raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         # Create distribution
-        self.distribution = Normal(mean, mean*0. + self.std)
+        self.distribution = Normal(mean, mean * 0.0 + self.std)
 
     def update_normalization(self, obs: TensorDict) -> None:
         if self.actor_obs_normalization:
@@ -207,15 +260,12 @@ class HIMActorCritic(nn.Module):
         self._update_distribution(obs)
         return self.distribution.sample()
     
-    def get_actions_log_prob(self, actions):
-        return self.distribution.log_prob(actions).sum(dim=-1)
-
     def act_inference(self, obs_history: TensorDict) -> torch.Tensor:
-        obs = self.get_actor_obs(obs_history)
-        obs = self.actor_obs_normalizer(obs)
-        vel, latent = self.estimator(obs)
-        actions_mean = self.actor(torch.cat((obs[:,:self.num_one_step_obs], vel, latent), dim=-1))
-        return actions_mean
+        obs = self.actor_obs_normalizer(self.get_actor_obs(obs_history))
+        hist = self._to_time_major(obs)  # (N, history_size, num_one_step_obs)
+        vel, latent = self.estimator(hist.flatten(1))
+        actor_input = torch.cat((hist[:, -1, :], vel, latent), dim=-1)
+        return self.actor(actor_input)
 
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs = self.get_critic_obs(obs)

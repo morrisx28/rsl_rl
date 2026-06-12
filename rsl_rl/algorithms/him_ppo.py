@@ -104,12 +104,15 @@ class HIMPPO:
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
     ) -> None:
+        # Compute flat critic obs dimension from obs groups
+        num_critic_obs = sum(obs[g].shape[-1] for g in self.policy.obs_groups["critic"])
         # Create rollout storage
         self.storage = HIMRolloutStorage(
             num_envs,
             num_transitions_per_env,
             obs,
             actions_shape,
+            num_critic_obs,
             self.device,
         )
 
@@ -135,6 +138,10 @@ class HIMPPO:
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+
+        # Store next critic obs (post-step obs) for estimator training
+        # obs here is the post-step observation, so its critic component is the "next" critic obs
+        self.transition.next_critic_observations = self.policy.get_critic_obs(obs).detach()
 
         # Bootstrapping on time outs
         if "time_outs" in extras:
@@ -172,6 +179,8 @@ class HIMPPO:
             old_actions_log_prob_batch,
             old_mu_batch,
             old_sigma_batch,
+            next_critic_obs_batch,
+            dones_batch,
             hidden_states_batch,
             masks_batch,
         ) in generator:
@@ -203,9 +212,9 @@ class HIMPPO:
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
-            self.policy.act(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[0])
+            self.policy.act(obs_batch)
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-            value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
+            value_batch = self.policy.evaluate(obs_batch)
             # Note: We only keep the entropy of the first augmentation (the original one)
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
@@ -229,8 +238,6 @@ class HIMPPO:
                         kl_mean /= self.gpu_world_size
 
                     # Update the learning rate only on the main process
-                    # TODO: Is this needed? If KL-divergence is the "same" across all GPUs,
-                    #       then the learning rate should be the same across all GPUs.
                     if self.gpu_global_rank == 0:
                         if kl_mean > self.desired_kl * 2.0:
                             self.learning_rate = max(1e-5, self.learning_rate / 1.5)
@@ -247,76 +254,84 @@ class HIMPPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-                #Estimator Update
-                obs_history_batch = self.policy.get_actor_obs(obs_batch)
-                next_critic_obs_batch = self.policy.get_critic_obs(obs_batch)
-                estimation_loss, swap_loss = self.policy.estimator.update(obs_history_batch, next_critic_obs_batch, lr=self.learning_rate)
+            # Estimator Update
+            # Use the time-major history so the encoder sees the same input ordering as in act().
+            # Skip done transitions: for terminated envs the post-step obs is the post-reset obs,
+            # so (history -> next_obs) pairs across a reset would corrupt the estimator targets.
+            # (HIMLoco instead substituted the true terminal privileged obs from its custom env.)
+            obs_history_batch = self.policy.get_actor_obs_history(obs_batch)
+            not_done = (dones_batch == 0).squeeze(-1)
+            if not_done.any():
+                estimation_loss, swap_loss = self.policy.estimator.update(
+                    obs_history_batch[not_done], next_critic_obs_batch[not_done], lr=self.learning_rate
+                )
+            else:
+                estimation_loss, swap_loss = 0.0, 0.0
 
-                # Surrogate loss
-                ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
-                surrogate = -torch.squeeze(advantages_batch) * ratio
-                surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(ratio, 1.0 - self.clip_param,
-                                                                                1.0 + self.clip_param)
-                surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            # Surrogate loss
+            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+            surrogate = -torch.squeeze(advantages_batch) * ratio
+            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(ratio, 1.0 - self.clip_param,
+                                                                            1.0 + self.clip_param)
+            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-                # Value function loss
-                if self.use_clipped_value_loss:
-                    value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(-self.clip_param,
-                                                                                                    self.clip_param)
-                    value_losses = (value_batch - returns_batch).pow(2)
-                    value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
+            # Value function loss
+            if self.use_clipped_value_loss:
+                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(-self.clip_param,
+                                                                                                self.clip_param)
+                value_losses = (value_batch - returns_batch).pow(2)
+                value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                value_loss = torch.max(value_losses, value_losses_clipped).mean()
+            else:
+                value_loss = (returns_batch - value_batch).pow(2).mean()
+
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+
+            # Symmetry loss
+            if self.symmetry:
+                # Obtain the symmetric actions
+                # Note: If we did augmentation before then we don't need to augment again
+                if not self.symmetry["use_data_augmentation"]:
+                    data_augmentation_func = self.symmetry["data_augmentation_func"]
+                    obs_batch, _ = data_augmentation_func(obs=obs_batch, actions=None, env=self.symmetry["_env"])
+                    # Compute number of augmentations per sample
+                    num_aug = int(obs_batch.shape[0] / original_batch_size)
+
+                # Actions predicted by the actor for symmetrically-augmented observations
+                mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
+
+                # Compute the symmetrically augmented actions
+                action_mean_orig = mean_actions_batch[:original_batch_size]
+                _, actions_mean_symm_batch = data_augmentation_func(
+                    obs=None, actions=action_mean_orig, env=self.symmetry["_env"]
+                )
+
+                # Compute the loss
+                mse_loss = torch.nn.MSELoss()
+                symmetry_loss = mse_loss(
+                    mean_actions_batch[original_batch_size:], actions_mean_symm_batch.detach()[original_batch_size:]
+                )
+                # Add the loss to the total loss
+                if self.symmetry["use_mirror_loss"]:
+                    loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
                 else:
-                    value_loss = (returns_batch - value_batch).pow(2).mean()
+                    symmetry_loss = symmetry_loss.detach()
 
-                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            # Gradient step
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            self.optimizer.step()
 
-                # Symmetry loss
-                if self.symmetry:
-                    # Obtain the symmetric actions
-                    # Note: If we did augmentation before then we don't need to augment again
-                    if not self.symmetry["use_data_augmentation"]:
-                        data_augmentation_func = self.symmetry["data_augmentation_func"]
-                        obs_batch, _ = data_augmentation_func(obs=obs_batch, actions=None, env=self.symmetry["_env"])
-                        # Compute number of augmentations per sample
-                        num_aug = int(obs_batch.shape[0] / original_batch_size)
+            mean_value_loss += value_loss.item()
+            mean_surrogate_loss += surrogate_loss.item()
+            mean_estimation_loss += estimation_loss
+            mean_swap_loss += swap_loss
+            mean_entropy += entropy_batch.mean().item()
 
-                    # Actions predicted by the actor for symmetrically-augmented observations
-                    mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
-
-                    # Compute the symmetrically augmented actions
-                    # Note: We are assuming the first augmentation is the original one. We do not use the action_batch from
-                    # earlier since that action was sampled from the distribution. However, the symmetry loss is computed
-                    # using the mean of the distribution.
-                    action_mean_orig = mean_actions_batch[:original_batch_size]
-                    _, actions_mean_symm_batch = data_augmentation_func(
-                        obs=None, actions=action_mean_orig, env=self.symmetry["_env"]
-                    )
-
-                    # Compute the loss
-                    mse_loss = torch.nn.MSELoss()
-                    symmetry_loss = mse_loss(
-                        mean_actions_batch[original_batch_size:], actions_mean_symm_batch.detach()[original_batch_size:]
-                    )
-                    # Add the loss to the total loss
-                    if self.symmetry["use_mirror_loss"]:
-                        loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
-                    else:
-                        symmetry_loss = symmetry_loss.detach()
-                # Gradient step
-                self.optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                self.optimizer.step()
-
-                mean_value_loss += value_loss.item()
-                mean_surrogate_loss += surrogate_loss.item()
-                mean_estimation_loss += estimation_loss
-                mean_swap_loss += swap_loss
-
-                # Symmetry loss
-                if mean_symmetry_loss is not None:
-                    mean_symmetry_loss += symmetry_loss.item()
+            # Symmetry loss
+            if mean_symmetry_loss is not None:
+                mean_symmetry_loss += symmetry_loss.item()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates

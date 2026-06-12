@@ -19,15 +19,17 @@ class HIMRolloutStorage:
             self.actions_log_prob: torch.Tensor
             self.action_mean: torch.Tensor | None = None
             self.action_sigma: torch.Tensor | None = None
-        
+            self.next_critic_observations: torch.Tensor | None = None
+
         def clear(self):
             self.__init__()
 
-    def __init__(self, 
-                 num_envs: int, 
-                 num_transitions_per_env: int, 
-                 obs: TensorDict, 
-                 actions_shape: tuple[int] | list[int], 
+    def __init__(self,
+                 num_envs: int,
+                 num_transitions_per_env: int,
+                 obs: TensorDict,
+                 actions_shape: tuple[int] | list[int],
+                 num_critic_obs: int,
                  device='cpu'):
 
         self.device = device
@@ -41,6 +43,7 @@ class HIMRolloutStorage:
             batch_size=[num_transitions_per_env, num_envs],
             device=self.device,
         )
+        self.next_critic_observations = torch.zeros(num_transitions_per_env, num_envs, num_critic_obs, device=self.device)
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
@@ -59,6 +62,7 @@ class HIMRolloutStorage:
         if self.step >= self.num_transitions_per_env:
             raise AssertionError("Rollout buffer overflow")
         self.observations[self.step].copy_(transition.observations)
+        self.next_critic_observations[self.step].copy_(transition.next_critic_observations)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
@@ -102,6 +106,8 @@ class HIMRolloutStorage:
 
         # Core
         observations = self.observations.flatten(0, 1)
+        next_critic_observations = self.next_critic_observations.flatten(0, 1)
+        dones = self.dones.flatten(0, 1)
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
@@ -121,6 +127,8 @@ class HIMRolloutStorage:
 
                 # Create the mini-batch
                 obs_batch = observations[batch_idx]
+                next_critic_obs_batch = next_critic_observations[batch_idx]
+                dones_batch = dones[batch_idx]
                 actions_batch = actions[batch_idx]
                 target_values_batch = values[batch_idx]
                 returns_batch = returns[batch_idx]
@@ -143,6 +151,8 @@ class HIMRolloutStorage:
                     old_actions_log_prob_batch,
                     old_mu_batch,
                     old_sigma_batch,
+                    next_critic_obs_batch,
+                    dones_batch,
                     (
                         hidden_state_a_batch,
                         hidden_state_c_batch,
