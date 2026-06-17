@@ -78,6 +78,9 @@ class HIMPPO:
         # PPO components
         self.policy = policy
         self.policy.to(self.device)
+        # Propagate multi-GPU settings to the estimator so it can sync its own gradients
+        self.policy.estimator.is_multi_gpu = self.is_multi_gpu
+        self.policy.estimator.gpu_world_size = self.gpu_world_size
         self.storage: HIMRolloutStorage | None = None
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
         self.transition = HIMRolloutStorage.Transition()
@@ -320,6 +323,9 @@ class HIMPPO:
             # Gradient step
             self.optimizer.zero_grad()
             loss.backward()
+            # Average gradients across GPUs before clipping/stepping
+            if self.is_multi_gpu:
+                self.reduce_parameters()
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
@@ -353,3 +359,43 @@ class HIMPPO:
             loss_dict["symmetry"] = mean_symmetry_loss
 
         return loss_dict
+
+    """
+    Helper functions for distributed training.
+    """
+
+    def broadcast_parameters(self) -> None:
+        """Broadcast model parameters to all GPUs.
+
+        The policy ``state_dict`` includes the estimator submodule, so this synchronizes the
+        actor, critic, and estimator weights from rank 0 to every other rank.
+        """
+        # Obtain the model parameters on current GPU
+        model_params = [self.policy.state_dict()]
+        # Broadcast the model parameters from rank 0
+        torch.distributed.broadcast_object_list(model_params, src=0)
+        # Load the model parameters on all GPUs from source GPU
+        self.policy.load_state_dict(model_params[0])
+
+    def reduce_parameters(self) -> None:
+        """Collect gradients from all GPUs and average them.
+
+        This function is called after the backward pass to synchronize the gradients across all GPUs.
+        """
+        # Create a tensor to store the gradients
+        grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
+        all_grads = torch.cat(grads)
+
+        # Average the gradients across all GPUs
+        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        all_grads /= self.gpu_world_size
+
+        # Update the gradients for all parameters with the reduced gradients
+        offset = 0
+        for param in self.policy.parameters():
+            if param.grad is not None:
+                numel = param.numel()
+                # Copy data back from shared buffer
+                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+                # Update the offset for the next parameter
+                offset += numel

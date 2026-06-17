@@ -57,6 +57,10 @@ class HIMEstimator(nn.Module):
         self.learning_rate = learning_rate
         self.optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
 
+        # Distributed training parameters (set by the algorithm when multi-GPU is enabled)
+        self.is_multi_gpu = False
+        self.gpu_world_size = 1
+
     def get_latent(self, obs_history):
         vel, z = self.encode(obs_history)
         return vel.detach(), z.detach()
@@ -110,10 +114,30 @@ class HIMEstimator(nn.Module):
 
         self.optimizer.zero_grad()
         losses.backward()
+        # Average gradients across GPUs before clipping/stepping so every rank's estimator stays in sync
+        if self.is_multi_gpu:
+            self.reduce_parameters()
         nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
         self.optimizer.step()
 
         return estimation_loss.item(), swap_loss.item()
+
+    def reduce_parameters(self):
+        """Collect gradients from all GPUs and average them in-place."""
+        grads = [param.grad.view(-1) for param in self.parameters() if param.grad is not None]
+        all_grads = torch.cat(grads)
+
+        # Average the gradients across all GPUs
+        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        all_grads /= self.gpu_world_size
+
+        # Write the averaged gradients back into each parameter
+        offset = 0
+        for param in self.parameters():
+            if param.grad is not None:
+                numel = param.numel()
+                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+                offset += numel
 
 
 @torch.no_grad()
