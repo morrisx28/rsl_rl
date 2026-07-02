@@ -262,12 +262,12 @@ class HIMPPO:
             # (HIMLoco instead substituted the true terminal privileged obs from its custom env.)
             obs_history_batch = self.policy.get_actor_obs_history(obs_batch)
             not_done = (dones_batch == 0).squeeze(-1)
-            if not_done.any():
-                estimation_loss, swap_loss = self.policy.estimator.update(
-                    obs_history_batch[not_done], next_critic_obs_batch[not_done], lr=self.learning_rate
-                )
-            else:
-                estimation_loss, swap_loss = 0.0, 0.0
+            # Always call the estimator update (even when the masked batch is empty) so that, under
+            # distributed training, the all_reduce inside it fires the same number of times on every
+            # rank. A data-dependent skip here would desync the collectives and hang NCCL.
+            estimation_loss, swap_loss = self.policy.estimator.update(
+                obs_history_batch[not_done], next_critic_obs_batch[not_done], lr=self.learning_rate
+            )
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))

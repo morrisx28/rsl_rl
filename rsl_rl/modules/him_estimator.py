@@ -82,7 +82,24 @@ class HIMEstimator(nn.Module):
             self.learning_rate = lr
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = self.learning_rate
-                
+
+        # Empty batch (e.g. a minibatch whose transitions are all terminal).
+        if obs_history.shape[0] == 0:
+            # Single-GPU: nothing to learn from -> skip the step entirely (original behavior).
+            if not self.is_multi_gpu:
+                return 0.0, 0.0
+            # Distributed: this rank has no local data, but other ranks may. We must still take part
+            # in the gradient all_reduce (otherwise the collectives desync and NCCL hangs). Produce
+            # zero local grads for every parameter, then step on the averaged gradient — which is the
+            # mean of all ranks' grads, so every rank stays bitwise in sync.
+            losses = sum(p.sum() for p in self.parameters()) * 0.0
+            self.optimizer.zero_grad()
+            losses.backward()
+            self.reduce_parameters()
+            nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+            return 0.0, 0.0
+
         vel = next_critic_obs[:, self.num_one_step_obs:self.num_one_step_obs+3].detach()
         next_obs = next_critic_obs.detach()[:, 3:self.num_one_step_obs+3]
 
